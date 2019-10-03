@@ -1,0 +1,24 @@
+("quicklisp" .
+ (:class qlot.source.ql:source-ql-all
+  :initargs (:distribution "http://beta.quicklisp.org/dist/quicklisp.txt" :%version :latest)
+  :version "2019-08-13"))
+("alexandria" .
+ (:class qlot.source.ql:source-ql
+  :initargs (:project-name "alexandria" :distribution "http://beta.quicklisp.org/dist/quicklisp.txt" :%version :latest)
+  :version "ql-2019-08-13"))
+("let-plus" .
+ (:class qlot.source.ql:source-ql
+  :initargs (:project-name "let-plus" :distribution "http://beta.quicklisp.org/dist/quicklisp.txt" :%version :latest)
+  :version "ql-2019-08-13"))
+("trivia" .
+ (:class qlot.source.ql:source-ql
+  :initargs (:project-name "trivia" :distribution "http://beta.quicklisp.org/dist/quicklisp.txt" :%version :latest)
+  :version "ql-2019-08-13"))
+("maxpc" .
+ (:class qlot.source.ql:source-ql
+  :initargs (:project-name "maxpc" :distribution "http://beta.quicklisp.org/dist/quicklisp.txt" :%version :latest)
+  :version "ql-2019-08-13"))
+("parachute" .
+ (:class qlot.source.ql:source-ql
+  :initargs (:project-name "parachute" :distribution "http://beta.quicklisp.org/dist/quicklisp.txt" :%version :latest)
+  :version "ql-2019-08-13"))
