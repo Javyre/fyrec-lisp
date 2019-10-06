@@ -100,9 +100,9 @@
          (chr   (third  pos))
          (start (if (= line 0)
                     0
-                    (or (nth-position (1- line) #\newline str)
-                        (error "Line index out of bounds"))))
-         (end   (or (position #\newline str :start (1+ start))
+                    (1+ (or (nth-position (1- line) #\newline str)
+                            (error "Line index out of bounds")))))
+         (end   (or (position #\newline str :start start)
                     (length str)))
 
          (line-view (subseq str start end))
