@@ -152,12 +152,12 @@ main() = {
                            (digit-char-p c)
                            (member c '(#\_)))))))))
 
-(defparse =integer
+(defparse =integer-lit
   (%named-tok "integer"
     (%map (%subseq (%some (=satisfies (c) (digit-char-p c))))
           (str) (parse-integer str))))
 
-(defparse =string
+(defparse =string-lit
   (%named-tok "string"
     (constantly nil)))
 
@@ -189,8 +189,8 @@ main() = {
             (make-funcal :name id :args args)))
 
 (defparse =litera
-  (%or (%map (=integer) (v) (make-litera :vty :integer :val v))
-       (%map (=string)  (v) (make-litera :vty :string  :val v))))
+  (%or (%map (=integer-lit) (v) (make-litera :vty :integer :val v))
+       (%map (=string-lit)  (v) (make-litera :vty :string  :val v))))
 
 (defparse =eblock
   (%braces (%destruc (%list (%any (%destruc (%list (%or (=varlet)
