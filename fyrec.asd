@@ -8,7 +8,8 @@
                 ((:file "parser")
                  (:file "fyrec")
                  (:file "infer")
-                 (:file "ast-gen"))))
+                 (:file "ast-gen")
+                 (:file "compile"))))
   :description "A prototype fyre compiler"
   :long-description
   #.(read-file-string
