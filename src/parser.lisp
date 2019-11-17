@@ -14,8 +14,10 @@
     %some
     %maybe
     %named
+    %get-pos
     =seq
     =string
+    print-error-at-pos
     parse))
 
 (in-package :fyrec.parser)
@@ -44,7 +46,7 @@
 (defstruct span
   (arr (error "need data") :type simple-string)
   (start 0 :type fixnum) ;; inclusing start
-  (end   0 :type fixnum) ;; exclusive end 
+  (end   0 :type fixnum) ;; exclusive end
 
   (line  0 :type fixnum)
   (chr   0 :type fixnum))
@@ -72,7 +74,7 @@
                :line  (if newline?
                           (1+ (span-line span))
                           (span-line span))
-               :chr   (if newline? 
+               :chr   (if newline?
                           0
                           (1+ (span-chr span))))))
 
@@ -90,7 +92,7 @@
 (defmethod input-pos ((span span))
   (declare (optimize (speed 3) (debug 0) (safety 0)))
   (values
-   (span-start span) 
+   (span-start span)
    (span-line  span)
    (span-chr   span)))
 
@@ -117,7 +119,7 @@
 
 (defun =take/impl (input)
   (unless (input-empty-p input)
-    (values 
+    (values
       (input-rest input)
       (constantly (input-first input)))))
 
@@ -126,7 +128,7 @@
     (when rst
       (let ((val-eval (funcall val)))
         (when (funcall fn val-eval)
-          (values 
+          (values
             rst
             (constantly val-eval)))))))
 
@@ -157,7 +159,7 @@
         with vals = '()
         while rst
         do (setf lst rst)
-        do (let (val) 
+        do (let (val)
              (setf (values rst val) (funcall parser rst))
              (when rst
                (push val vals)))
@@ -220,7 +222,7 @@
 (defmacro =eof () '#'=eof/impl)
 
 (defmacro %map (parser (v-id) &body body)
-  `(lambda (in) (%map/impl in ,parser 
+  `(lambda (in) (%map/impl in ,parser
                            (lambda (,v-id) ,@body))))
 (defmacro %subseq (parser)
   `(lambda (in) (%subseq/impl in ,parser)))
@@ -236,7 +238,7 @@
 
 (defmacro %destruc (parser (&rest pat) &body body)
   (let ((v-id (gensym))
-        npat 
+        npat
         ignores)
     (setf npat (mapcar (lambda (e)
                          (if (and (symbolp e)
@@ -261,8 +263,15 @@
 (defmacro %named (name parser)
   `(lambda (in) (%named/impl in ,name ,parser)))
 
+(defmacro %get-pos (name &body parser)
+  `(lambda (in) (let ((,name (multiple-value-bind
+                               (abs-pos linum chrnum)
+                               (input-pos in)
+                               (list abs-pos linum chrnum))))
+                  (funcall ,(first parser) in))))
+
 (defmacro =seq (seq &key (test #'equal))
-  `(%map (%list ,(map 'list 
+  `(%map (%list ,(map 'list
                       (lambda (e)
                         `(=satisfies (c)
                            (funcall ,test ,e c)))
@@ -270,6 +279,7 @@
          (val)
          (declare (ignore val))
          ,seq))
+
 
 (defmacro =string (str)
   `(%map (%list ,@(loop for c across str
@@ -279,6 +289,15 @@
          (declare (ignore val))
          ,str))
 
+(defun print-error-at-pos (input err pos  &key (fname "-") (make-in nil))
+  (destructuring-bind (abs-pos linum chrnum) pos
+    (declare (ignore abs-pos))
+    (format t "~&~A:~A:~A:~A~
+               ~{~%| ~A~}~
+               ~%"
+            fname linum chrnum err
+            (input-line-preview (if make-in (make-input input) input) pos))))
+
 (defun parse (input parser &key (fname "-"))
   (let ((*parse-failures* '())
         (*furthest-parse-failure* '(-1 -1 -1))
@@ -287,19 +306,31 @@
       (funcall parser input)
       (if rst
           (funcall val)
-          (destructuring-bind (pos linum chrnum) *furthest-parse-failure*
-            (format t "~&~A:~A:~A:expected one of: ~{~A~^, ~}~
-                       ~{~%| ~A~}~
-                       ~%"
-                    fname
-                    linum
-                    chrnum
-                    (loop for f in *parse-failures*
-                          with r = '()
-                          when (= (car f) pos)
-                          do (setf r (adjoin (cdr f) r :test #'equal))
-                          finally (return r))
-                    (input-line-preview input *furthest-parse-failure*)))))))
+          (let* ((abs-pos  (first *furthest-parse-failure*))
+                 (expected (loop for f in *parse-failures*
+                                 with r = '()
+                                 when (= (car f) abs-pos)
+                                 do (setf r (adjoin (cdr f) r :test #'equal))
+                                 finally (return r)))
+                 (err (format nil "expected one of: ~{~A~^, ~}" expected)))
+
+            (print-error-at-pos input err *furthest-parse-failure* :fname fname))
+
+          ; (destructuring-bind (pos linum chrnum) *furthest-parse-failure*
+          ;   (format t "~&~A:~A:~A:expected one of: ~{~A~^, ~}~
+          ;              ~{~%| ~A~}~
+          ;              ~%"
+          ;           fname
+          ;           linum
+          ;           chrnum
+          ;           (loop for f in *parse-failures*
+          ;                 with r = '()
+          ;                 when (= (car f) pos)
+          ;                 do (setf r (adjoin (cdr f) r :test #'equal))
+          ;                 finally (return r))
+          ;           (input-line-preview input *furthest-parse-failure*)))
+
+            ))))
 
 #+nil
 (time (parse "test" #.(%subseq (%any (=satisfies (c)

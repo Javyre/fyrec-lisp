@@ -107,6 +107,9 @@ main() = {
   `(%destruc (%list (=ws) ,parser)
              (_ r) r))
 
+(defmacro %get-tok-pos (name &body parser)
+  `(%tok (%get-pos ,name ,@parser)))
+
 (defmacro =char-tok (chr)
   (let ((chr (if (stringp chr)
                  (progn (assert (= 1 (length chr)))
@@ -180,42 +183,55 @@ main() = {
   (%or (=fundef)))
 
 (defparse =fundef
-  (%destruc (%list
-              (=ident) (%parens (%any-sep-by (=char-tok ",") (=ident)))
-              (=char-tok "=") (=expr))
-            (id args _ val)
-            (make-fundef :name id
-                         :args args
-                         :body val)))
+  (%get-tok-pos pos
+    (%destruc (%list
+                (=ident) (%parens (%any-sep-by (=char-tok ",") (=ident)))
+                (=char-tok "=") (=expr))
+              (id args _ val)
+              (make-fundef :name id
+                           :args args
+                           :body val
+                           :src-pos pos))))
 
 (defparse =funcal
-  (%destruc (%list
-              (=ident) (%parens (%any-sep-by (=char-tok ",") (=expr))))
-            (id args)
-            (make-funcal :name id :args args)))
+  (%get-tok-pos pos
+    (%destruc (%list
+                (=ident) (%parens (%any-sep-by (=char-tok ",") (=expr))))
+              (id args)
+              (make-funcal :name id
+                           :args args
+                           :src-pos pos))))
 
 (defparse =litera
-  (%or (%map (=integer-lit) (v) (make-litera :vty :integer :val v))
-       (%map (=string-lit)  (v) (make-litera :vty :string  :val v))))
+  (%get-tok-pos pos
+    (%or (%map (=integer-lit) (v) (make-litera :vty :integer :val v :src-pos pos))
+         (%map (=string-lit)  (v) (make-litera :vty :string  :val v :src-pos pos)))))
 
 (defparse =eblock
-  (%braces (%destruc (%list (%any (%destruc (%list (%or (=varlet)
-                                                        (=expr))
-                                                   (=char-tok ";"))
-                                            (e _) e))
-                            (=expr))
-                     (stmts expr)
-                     (make-eblock :stmts stmts :expr expr))))
+  (%get-tok-pos pos
+    (%braces (%destruc (%list (%any (%destruc (%list (%or (=varlet)
+                                                          (=expr))
+                                                     (=char-tok ";"))
+                                              (e _) e))
+                              (=expr))
+                       (stmts expr)
+                       (make-eblock :stmts stmts
+                                    :expr expr
+                                    :src-pos pos)))))
 
 (defparse =varlet
-  (%destruc (%list (=ident) (=char-tok "=") (=expr))
-            (name _ val)
-            (make-varlet :name name :val val)))
+  (%get-tok-pos pos
+    (%destruc (%list (=ident) (=char-tok "=") (=expr))
+              (name _ val)
+              (make-varlet :name name
+                           :val val
+                           :src-pos pos))))
 
 (defparse =varref
-  (%map (=ident)
-        (name)
-        (make-varref :name name)))
+  (%get-tok-pos pos
+    (%map (=ident)
+          (name)
+          (make-varref :name name :src-pos pos))))
 
 (defparse =expr
   (%or (=eblock)

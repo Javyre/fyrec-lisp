@@ -54,7 +54,7 @@ CONSTRAINT GENERATION:
 
 (defstruct module toplvls)
 
-(defstruct ast-node (id (gen-node-id)))
+(defstruct ast-node (id (gen-node-id)) src-pos)
 (defmacro defnode (name &rest r)
   `(defstruct (,name (:include ast-node)) ,@r))
 
@@ -78,9 +78,10 @@ CONSTRAINT GENERATION:
 
 ;;=============================================================================
 
-(defstruct typ-eq a b)
-(defstruct scm-eq sv ty ty-ctx)
-(defstruct ins-eq sv tv)
+(defparameter *cur-src-pos* nil)
+(defstruct typ-eq a b (src-pos *cur-src-pos*))
+(defstruct scm-eq sv ty ty-ctx (src-pos *cur-src-pos*))
+(defstruct ins-eq sv tv (src-pos *cur-src-pos*))
 
 (defstruct tvar name)
 (defstruct svar name)
@@ -90,6 +91,9 @@ CONSTRAINT GENERATION:
 (defstruct trait-t name args) ;; TODO: <-
 
 ;;=============================================================================
+
+(defparameter *infer-current-prg* nil
+  "The current program being inferred. For error messages.")
 
 (defparameter *tvar-count* 0)
 (defun gen-var (&optional (v 'T))
@@ -130,33 +134,60 @@ CONSTRAINT GENERATION:
                      ,@(reduce #'append (reverse eqs)))))))
 
 (defun gen-eqs-fundef (ctx f)
-  (let-match* (((fundef name args body id) f)
-               ((and ty2 (svar)) (ctx-get ctx name))
-               (ty1 (gen-tvar))
-               (rty (gen-tvar))
-               (aty (mapcar (lambda (_)
-                              (declare (ignore _))
-                              (gen-tvar))
-                            args))
+  (let-match* (((fundef name args body id :src-pos *cur-src-pos*) f))
+    (ematch (ctx-get ctx name)
+      ;; polymorphic function
+      ((and ty2 (svar))
+       (let* ((ty1 (gen-tvar))
+              (rty (gen-tvar))
+              (aty (mapcar (lambda (_)
+                             (declare (ignore _))
+                             (gen-tvar))
+                           args))
 
-               (eq0   (make-typ-eq :a (node-id->tvar id) :b ty1))
+              (eq0   (make-typ-eq :a (node-id->tvar id) :b ty1))
 
-               (funty (make-type-t :name 'fun
-                                   :args (append aty (list rty))))
-               (eq1   (make-typ-eq :a ty1
-                                   :b funty))
-               (eq2   (make-scm-eq :sv ty2
-                                   :ty ty1
-                                   :ty-ctx ctx))
+              (funty (make-type-t :name :fun
+                                  :args (append aty (list rty))))
+              (eq1   (make-typ-eq :a ty1
+                                  :b funty))
+              (eq2   (make-scm-eq :sv ty2
+                                  :ty ty1
+                                  :ty-ctx ctx))
 
-               (body-ctx (append ctx (mapcar #'cons args aty)))
-               (eqs (gen-eqs-expr body-ctx body rty)))
+              (body-ctx (append ctx (mapcar #'cons args aty)))
+              (eqs (gen-eqs-expr body-ctx body rty)))
 
-    (values `(,eq1 ,eq0 ,@eqs)
-            `(,eq2)))) ;; toplvl scm-eqs should be first in the gen'd constraints
+         (assert-all-fun-args-used f args aty eqs)
+
+         ;; toplvl scm-eqs should be first in the gen'd constraints
+         (values `(,eq1 ,eq0 ,@eqs)
+                 `(,eq2))))
+
+      ;; monomorphic function
+      ((and ty1 (tvar))
+       (let* ((rty   (gen-tvar))
+              (aty   (mapcar (lambda (_)
+                               (declare (ignore _))
+                               (gen-tvar))
+                             args))
+
+              (eq0   (make-typ-eq :a (node-id->tvar id) :b ty1))
+
+              (funty (make-type-t :name :fun
+                                  :args (append aty (list rty))))
+
+              (eq1   (make-typ-eq :a ty1
+                                  :b funty))
+
+              (body-ctx (append ctx (mapcar #'cons args aty)))
+              (eqs (gen-eqs-expr body-ctx body rty)))
+         (values `(,eq1 ,eq0 ,@eqs)
+                 `()))))))
 
 (defun gen-eqs-expr (ctx expr ty)
-  (let ((eq0  (make-typ-eq :a (node-id->tvar (ast-node-id expr))
+  (let* ((*cur-src-pos* (ast-node-src-pos expr))
+         (eq0  (make-typ-eq :a (node-id->tvar (ast-node-id expr))
                            :b ty)))
     `(,@(gen-eqs-expr/impl ctx expr ty) ,eq0)))
 
@@ -182,10 +213,11 @@ CONSTRAINT GENERATION:
     ((funcal name args)
      (let-match* ((aty (mapcar (lambda (_) (declare (ignore _)) (gen-tvar))
                                args))
-                  ((and fty (svar)) (ctx-get ctx name))
+                  (fty (ctx-get ctx name))
 
-                  (funty (make-type-t :name 'fun :args (append aty (list ty))))
-                  (eq1   (make-ins-eq :sv fty :tv funty))
+                  (funty (make-type-t :name :fun :args (append aty (list ty))))
+                  (eq1   (cond ((svar-p fty) (make-ins-eq :sv fty :tv funty))
+                               ((tvar-p fty) (make-typ-eq :a fty :b funty))))
 
                   (a-eqs (mapcar (lambda (arg ty)
                                    (gen-eqs-expr ctx arg ty))
@@ -210,7 +242,13 @@ CONSTRAINT GENERATION:
         with ctx = '()
         do (ematch toplvl
              ;; All functions are svars since they call all be polymorhpic
-             ((fundef name) (push (cons name (gen-svar)) ctx)))
+             ((fundef name args)
+              ;; funcs of arity=0 are cannot be polymorphic
+              (push (cons name (if args
+                                   (gen-svar)
+                                   (gen-tvar)))
+                    ctx)))
+
         finally (return ctx)))
 
 ;;=============================================================================
@@ -236,30 +274,38 @@ CONSTRAINT GENERATION:
 
              ;; tvar = x | x = tvar
              ((or (typ-eq :a (and tv (tvar))
-                          :b x)
+                          :b x
+                          :src-pos p)
                   (typ-eq :a x
-                          :b (and tv (tvar))))
+                          :b (and tv (tvar))
+                          :src-pos p))
               (if (occurs? tv x)
                   (error (format nil "recursive type for ~S" tv))
-                  (let ((sub (list (make-typ-eq :a tv :b x))))
+                  (let ((sub (list (make-typ-eq :a tv :b x :src-pos p))))
                     (setf eqs (subst-eqs     eqs sub))
                     (setf sol (compose-subst sol sub)))))
 
              ;; <type> args... = <type> args...
              ((guard (typ-eq :a (type-t :name an :args a-args)
-                             :b (type-t :name bn :args b-args))
+                             :b (type-t :name bn :args b-args)
+                             :src-pos p)
                      (and (equal an bn)
                           (= (length a-args)
                              (length b-args))))
               (loop for a-aty in a-args
                     for b-aty in b-args
                     do (push (make-typ-eq :a a-aty
-                                          :b b-aty)
+                                          :b b-aty
+                                          :src-pos p)
                              eqs)))
              ;; Type mismatch
-             ((typ-eq a b)
-              (error (format nil "type mismatch: ~
-                                  ~/fyrec:pprint-ty/ and ~/fyrec:pprint-ty/" a b))))
+             ((typ-eq a b src-pos)
+              (let ((err (format nil "type mismatch: ~
+                                      ~/fyrec:pprint-ty/ and ~/fyrec:pprint-ty/"
+                                 a b)))
+                   (print-error-at-pos *infer-current-prg* err src-pos
+                                    :make-in t)
+                   (error "type mismatch"))))
 
         finally (return sol)))
 
@@ -276,13 +322,28 @@ CONSTRAINT GENERATION:
                 (setf i-eqs (remove-if-not pred eqs))
                 (setf eqs   (remove-if     pred eqs))
                 (let* ((e-eqs (mapcar
-                              (lambda-ematch
-                                ((ins-eq tv)
-                                 (make-typ-eq :a tv
-                                              :b (inst-scm e))))
-                              i-eqs))
+                                (lambda-ematch
+                                  ((ins-eq tv src-pos)
+                                   (make-typ-eq :a tv
+                                                :b (inst-scm e)
+                                                :src-pos src-pos)))
+                                i-eqs))
                        (sub (e-unify e-eqs)))
-                  (setf sol (compose-subst sol sub)))))
+
+
+                  (setf sol (compose-subst sol sub))
+
+                  ;; ======
+                  (when (match e ((scm-eq ; :sv (svar :name 'S1)
+                                          ) t))
+                    (break (format nil "break~%e: ~/fyrec:pprint-eq/~2%~
+                                        i-eqs: ~/fyrec:pprint-eqs/~2%~
+                                        others (eqs): ~/fyrec:pprint-eqs/~2%~
+                                        gened-eqs (e-eqs): ~/fyrec:pprint-eqs/~2%~
+                                        sub: ~/fyrec:pprint-eqs/~2%~
+                                        sol: ~/fyrec:pprint-eqs/"
+                                   e i-eqs eqs e-eqs sub sol)))
+                  )))
 
              ((ins-eq)
               (error "BUG: bad order of generated si-eqs.
@@ -314,16 +375,19 @@ CONSTRAINT GENERATION:
 (defun subst-eq (e sub)
   "Substitute the tvars of both sides of e according to sub"
   (ematch e
-    ((typ-eq a b)
+    ((typ-eq a b src-pos)
      (make-typ-eq :a (subst-ty a sub)
-                  :b (subst-ty b sub)))
-    ((scm-eq sv ty ty-ctx)
+                  :b (subst-ty b sub)
+                  :src-pos src-pos))
+    ((scm-eq sv ty ty-ctx src-pos)
      (make-scm-eq :sv sv
                   :ty (subst-ty ty sub)
-                  :ty-ctx (subst-ctx ty-ctx sub)))
-    ((ins-eq sv tv)
+                  :ty-ctx (subst-ctx ty-ctx sub)
+                  :src-pos src-pos))
+    ((ins-eq sv tv src-pos)
      (make-ins-eq :sv sv
-                  :tv (subst-ty tv sub)))))
+                  :tv (subst-ty tv sub)
+                  :src-pos src-pos))))
 
 (defun subst-ty (ty sub)
   "Substitute the tvars of ty according to sub"
@@ -344,19 +408,21 @@ CONSTRAINT GENERATION:
 (defun compose-subst (sub1 sub2)
   "Compose two substitutions such that (s2 ∘ s1)(x) = s2(s1(x))"
   ;; nconc modifies all but last arg
-  (nconc (mapcar (lambda-ematch ((typ-eq a b)
+  (nconc (mapcar (lambda-ematch ((typ-eq a b src-pos)
                                  (make-typ-eq :a a
-                                              :b (subst-ty b sub2))))
+                                              :b (subst-ty b sub2)
+                                              :src-pos src-pos)))
                  sub1)
          sub2))
 
 (defun inst-scm (s-eq)
   "instantiate bound variables in the scheme with fresh free variables"
-  (let-match* (((scm-eq ty) s-eq)
+  (let-match* (((scm-eq ty src-pos) s-eq)
                (bound-vars (scm-eq-bound-vars s-eq))
                (instantiation-sub (mapcar (lambda (tv)
                                             (make-typ-eq :a tv
-                                                         :b (gen-tvar)))
+                                                         :b (gen-tvar)
+                                                         :src-pos src-pos))
                                           bound-vars)))
     (subst-ty ty instantiation-sub)))
 
@@ -384,8 +450,9 @@ CONSTRAINT GENERATION:
 
           :initial-value '()))
 
-(defun infer-module (m)
-  (solve-eqs (gen-eqs-module m)))
+(defun infer-module (m prg)
+  (let ((*infer-current-prg* prg))
+    (solve-eqs (gen-eqs-module m))))
 
 (defun ast-eqs->table (eqs)
   (let ((table (make-hash-table :test #'equal)))
@@ -399,6 +466,33 @@ CONSTRAINT GENERATION:
                                   (ins-eq)) nil))
               eqs))
     table))
+
+;;=============================================================================
+;; VALIDATING
+
+;; If not all fun args are used in the body, the type of the function
+;;  will never be resolved as the eq for the unused arg will never have
+;;  a right handn side
+(defun assert-all-fun-args-used (fun args aty eqs)
+  (loop for arg in args
+        for ty in aty
+        with bad = nil
+        do
+        (when (notany (lambda-ematch ((typ-eq a b) (or (occurs? ty a)
+                                                       (occurs? ty b)))
+                                     ((ins-eq tv) (occurs? ty tv))
+                                     ((scm-eq :ty sty) (occurs? ty sty)))
+                      eqs)
+          (setf bad t)
+          (let-match (((fundef src-pos) fun))
+            (print-error-at-pos
+              *infer-current-prg*
+              (format nil "unused function argument: ~A" arg)
+              src-pos
+              :make-in t)))
+        finally
+        (when bad
+          (error "unused argument(s) in function definition"))))
 
 ;;=============================================================================
 ;; PRINTING
@@ -462,21 +556,48 @@ CONSTRAINT GENERATION:
         (fresh-line s)
         (apply #'pprint-eq `(,s ,e ,@r))))
 
+(defun pprint-typed-ast (prg)
+  (with-fresh-tvars
+    (let* ((*pprint-tvar* nil)
+           (*ast-node-count* 0)
+           (ast (parse-module prg))
+           (sol (infer-module ast prg)))
+      ; (fresh-line)
+      ; (pprint-eqs t sol)
+      (fresh-line)
+      (sort sol (lambda-ematch* (((typ-eq :src-pos (list abs-a _ _))
+                                  (typ-eq :src-pos (list abs-b _ _)))
+                                 (< abs-a abs-b))))
+      (loop for e in sol do
+            (match e ((typ-eq :a tya ; (tvar :name (list :ast _))
+                              :b ty
+                              :src-pos src-pos)
+                      (let ((msg (format nil "type: ~A = ~A"
+                                         (pprint-ty nil tya)
+                                         (pprint-ty nil ty))))
+                        (print-error-at-pos prg msg src-pos :make-in t)))))
+
+      ; (fresh-line)
+      ; (format t "~A" ast)
+      )))
+
 #+nil
 (defparameter *test-prg*
-  "foo(a) = bar(1);
+  "foo() = bar(1);
    bar(b) = {
-       b = { baz(foo(b)) };
        b
    };
    baz(a) = a;")
+
+#+nil
+(pprint-typed-ast *test-prg*)
 
 #+nil
 (with-fresh-tvars
   (let* ((*pprint-tvar* nil)
          (*ast-node-count* 0)
          (ast (parse-module *test-prg*))
-         (sol (infer-module ast)))
+         (sol (infer-module ast *test-prg*)))
 
     (values (pprint-eqs t sol)
             (ast-eqs->table sol)
