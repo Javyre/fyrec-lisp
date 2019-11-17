@@ -159,7 +159,13 @@ main() = {
 
 (defparse =string-lit
   (%named-tok "string"
-    (constantly nil)))
+    (%destruc (%list (=string "\"")
+                     (%subseq (%any (%or (=satisfies (c)
+                                           (not (member c '(#\" #\\))))
+                                         (=string "\\\"")
+                                         (=string "\\\\"))))
+                     (=string "\""))
+              (_ s _) s)))
 
 ;;=============================================================================
 
