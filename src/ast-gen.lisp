@@ -19,10 +19,17 @@ main() = {
         d[1]
     };
 
+    e = d
+      | iter()
+      | enumerate();
+
+    e | map!((x) = x + 1);
+    for x in e: x + 1;
+
     c.0;
     get(c, 1);
     print('hi');
-    b(0)
+    c(0)
 };
 |#
 
@@ -155,6 +162,18 @@ main() = {
                            (digit-char-p c)
                            (member c '(#\_)))))))))
 
+(defparse =type-ident
+  (%named-tok "type-ident"
+    (%subseq (%list
+               (=satisfies (c)
+                 (or (upper-case-p c)
+                     (member c '(#\_))))
+	       (%any (=satisfies (c)
+                       (or (upper-case-p c)
+			   (lower-case-p c)
+                           (digit-char-p c)
+                           (member c '(#\_)))))))))
+
 (defparse =integer-lit
   (%named-tok "integer"
     (%map (%subseq (%some (=satisfies (c) (digit-char-p c))))
@@ -185,13 +204,34 @@ main() = {
 (defparse =fundef
   (%get-tok-pos pos
     (%destruc (%list
-                (=ident) (%parens (%any-sep-by (=char-tok ",") (=ident)))
-                (=char-tok "=") (=expr))
-              (id args _ val)
+                (=ident) (%parens (%any-sep-by
+				   (=char-tok ",")
+				   (%list (=ident) (%maybe (=etype)))))
+		(%maybe (=type))
+		(=char-tok "=") (=expr))
+              (id args ret-ty _ val)
               (make-fundef :name id
                            :args args
+			   :ret-ty ret-ty
                            :body val
                            :src-pos pos))))
+
+(defparse =etype
+  (%get-tok-pos pos
+    (%destruc (%list
+		(=type-ident)
+		(%any (%destruc
+			  (%list (=char-tok ".")
+                                 (%or (%get-tok-pos pos
+                                        (%map (=type-ident)
+                                              (id) (make-etype :name id
+                                                               :args nil
+                                                               :src-pos pos)))
+                                      (%parens (=etype))))
+                          (_ x) x)))
+	      (id args)
+              (make-etype :name id :args args :src-pos pos))))
+
 
 (defparse =funcal
   (%get-tok-pos pos
@@ -243,6 +283,14 @@ main() = {
   (parse prg (=module)))
 
 #+nil
-(parse "hello(abc) = abc(a({ a = b; 1 }));" #.(=fundef))
+(parse "hello(abc) = abc(a({ a = b; 1 }));" (=fundef))
 
+#+nil
+(parse "hello(abc Foo) Bar = abc();" (=fundef))
+
+;; Decls not impld yet
+#+nil
+(parse "
+hello :: (Foo) -> Bar;
+hello(abc) = abc();" (=module))
 

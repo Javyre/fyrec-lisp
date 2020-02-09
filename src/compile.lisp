@@ -39,13 +39,8 @@
          (fty   (make-type-t :name :fun 
                              :args (list rty))))
 
-    (compile-stdlib s)
+    (stdlib-compile-header s)
     (compile-fundef s mainf fty ctx)))
-
-(defun compile-stdlib (s)
-  ; (format s "~&@std.I32    = type i32")
-  ; (format s "~&@std.Int    = type @std.I32")
-  (format s "~&%std.String = type { i32, i8* }"))
 
 (defun compile-fundef (s f ty ctx)
   (ematch f

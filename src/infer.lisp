@@ -7,6 +7,7 @@ CONSTRAINT GENERATION:
                  G(&ctx toplvl <>)
 
     TOPLVL
+    ;; fundef is a combination of polymorphic let and lambda expr
     fundef -> fresh tvar aty... rty, ty1
               fresh svar ty2
 
@@ -24,6 +25,7 @@ CONSTRAINT GENERATION:
                     ty2 =s ty1 ctx
 
     STMT
+    ;; varlet is not polumorphic (not a polymorphic let)
     varlet -> fresh tvar ty0 and gen: ty e= UNIT
                    G(ctx e ty0)
                    ctx[vn = ty0]
@@ -59,7 +61,10 @@ CONSTRAINT GENERATION:
   `(defstruct (,name (:include ast-node)) ,@r))
 
 ;; Toplvl
-(defnode fundef name args body)
+(defnode fundef name args ret-ty body)
+
+;; Type
+(defnode etype name args)
 
 ;; Statement
 (defnode varlet name val)
@@ -78,9 +83,13 @@ CONSTRAINT GENERATION:
 
 ;;=============================================================================
 
+(defstruct types-scope
+  (vars  nil :read-only t)
+  (types nil :read-only t))
+
 (defparameter *cur-src-pos* nil)
 (defstruct typ-eq a b (src-pos *cur-src-pos*))
-(defstruct scm-eq sv ty ty-ctx (src-pos *cur-src-pos*))
+(defstruct scm-eq sv ty (ty-scp nil :type types-scope) (src-pos *cur-src-pos*))
 (defstruct ins-eq sv tv (src-pos *cur-src-pos*))
 
 (defstruct tvar name)
@@ -91,6 +100,11 @@ CONSTRAINT GENERATION:
 (defstruct trait-t name args) ;; TODO: <-
 
 ;;=============================================================================
+
+(defparameter *builtin-types-scope*
+  (make-types-scope :vars  `(("main" . ,(make-type-t :name :fun)))
+		    :types `(("Int" . :integer)
+			     ("Str" . :string))))
 
 (defparameter *infer-current-prg* nil
   "The current program being inferred. For error messages.")
@@ -107,25 +121,76 @@ CONSTRAINT GENERATION:
 
 (defun node-id->tvar (id)
   (make-tvar :name (list :ast id)))
+(defun ast-tvar-p (tv)
+  (and (tvar-p tv)
+       (listp (tvar-name tv))
+       (eql :ast (first (tvar-name tv)))))
 
-(defun ctx-get (ctx name)
-  (let ((r (assoc name ctx :test #'equal)))
+(defun etype->type-t (scope etype)
+  (let-match (((etype name args) etype))
+    (make-type-t :name (types-scope-get-typ scope name)
+		 :args (mapcar (lambda (a) (etype->type-t scope a))
+			       args))))
+
+;; vars types
+(defun types-scope-get-var (scope name)
+ (let ((r (assoc name (types-scope-vars scope) :test #'equal)))
     (if r
         (cdr r)
-        (error (format nil "symbol not found in context: ~A" name)))))
+        (error (format nil "var symbol not found in scope: ~A" name)))))
+(defun types-scope-get-typ (scope name)
+ (let ((r (assoc name (types-scope-types scope) :test #'equal)))
+    (if r
+        (cdr r)
+        (error (format nil "type symbol not found in scope: ~A" name)))))
+
+(defmacro map-types-scope-vars (scope (name) &body body)
+  (let ((scope-s (gensym)))
+    `(let ((,scope-s ,scope))
+       (make-types-scope
+	:types (types-scope-types ,scope-s)
+	:vars  (let ((,name (types-scope-vars ,scope-s)))
+		 ,@body)))))
+
+(defmacro map-types-scope-types (scope (name) &body body)
+  (let ((scope-s (gensym)))
+    `(let ((,scope-s ,scope))
+       (make-types-scope
+	:vars (types-scope-vars ,scope-s)
+	:types  (let ((,name (types-scope-types ,scope-s)))
+		  ,@body)))))
+
+(defun types-scope-set-var (scope name type)
+  (map-types-scope-vars scope (current)
+    `((,name . ,type) ,@current)))
+(defun types-scope-set-typ (scope name type)
+  (map-types-scope-types scope (current)
+    `((,name . ,type) ,@current)))
+
+(defun types-scope-set-vars (scope names types)
+  (map-types-scope-vars scope (current)
+    `(,@(mapcar #'cons names types) ,@current)))
+(defun types-scope-set-typs (scope names types)
+  (map-types-scope-types scope (current)
+    `(,@(mapcar #'cons names types) ,@current)))
+
+(defmacro types-scope-push-var (scope name type)
+  `(setf ,scope (types-scope-set-var ,scope ,name ,type)))
+(defmacro types-scope-push-typ (scope name type)
+  `(setf ,scope (types-scope-set-typ ,scope ,name ,type)))
 
 ;;=============================================================================
 ;; CONSTRAINT GENERATION
 
 (defun gen-eqs-module (m)
-  (let ((ctx (discover-toplvls m)))
+  (let ((scope (discover-toplvls *builtin-types-scope* m)))
     (loop for toplvl in (module-toplvls m)
           with eqs        = '()
           with toplvl-eqs = '()
           do
           (multiple-value-bind (eqs0 toplvl-eqs0)
             (ematch toplvl
-              ((fundef) (gen-eqs-fundef ctx toplvl)))
+              ((fundef) (gen-eqs-fundef scope toplvl)))
 
             (push eqs0        eqs)
             (push toplvl-eqs0 toplvl-eqs))
@@ -133,17 +198,32 @@ CONSTRAINT GENERATION:
           (return `( ,@(reduce #'append (reverse toplvl-eqs))
                      ,@(reduce #'append (reverse eqs)))))))
 
-(defun gen-eqs-fundef (ctx f)
-  (let-match* (((fundef name args body id :src-pos *cur-src-pos*) f))
-    (ematch (ctx-get ctx name)
+(defun gen-eqs-fundef (scope f)
+  (let-match* (((fundef name args ret-ty body id :src-pos *cur-src-pos*) f))
+    ;; Polymorhpic or not determined in discover-toplvls at the moment
+    (ematch (types-scope-get-var scope name)
       ;; polymorphic function
       ((and ty2 (svar))
        (let* ((ty1 (gen-tvar))
-              (rty (gen-tvar))
-              (aty (mapcar (lambda (_)
-                             (declare (ignore _))
-                             (gen-tvar))
-                           args))
+              (rty (if ret-ty
+		       (etype->type-t scope ret-ty)
+		       (gen-tvar)))
+	      (aty '())
+	      (aty-eqs (loop
+			  for (name type) in args
+			  for tvar = (gen-tvar)
+			  with aty-eqs = '()
+			  do (push tvar aty)
+			  when type do
+			    (push (make-typ-eq :a tvar
+					       :b (etype->type-t scope type)
+					       :src-pos (etype-src-pos type))
+				  aty-eqs)
+			  finally
+			    (setf aty (reverse aty))
+			    (return (reverse aty-eqs))))
+
+	      (arg-names (mapcar #'car args))
 
               (eq0   (make-typ-eq :a (node-id->tvar id) :b ty1))
 
@@ -153,103 +233,235 @@ CONSTRAINT GENERATION:
                                   :b funty))
               (eq2   (make-scm-eq :sv ty2
                                   :ty ty1
-                                  :ty-ctx ctx))
+                                  :ty-scp scope))
 
-              (body-ctx (append ctx (mapcar #'cons args aty)))
-              (eqs (gen-eqs-expr body-ctx body rty)))
+	      (body-scope (types-scope-set-vars scope arg-names aty))
+              (body-eqs (gen-eqs-expr body-scope body rty)))
 
-         (assert-all-fun-args-used f args aty eqs)
+         (assert-all-fun-args-used f args aty body-eqs)
 
          ;; toplvl scm-eqs should be first in the gen'd constraints
-         (values `(,eq1 ,eq0 ,@eqs)
+         (values `(,eq1 ,eq0 ,@aty-eqs ,@body-eqs)
                  `(,eq2))))
 
       ;; monomorphic function
-      ((and ty1 (tvar))
-       (let* ((rty   (gen-tvar))
-              (aty   (mapcar (lambda (_)
-                               (declare (ignore _))
-                               (gen-tvar))
-                             args))
+      ;; ((and ty1 (tvar))
+      ;;  (error "No function should be monomorphic!")
+      ;;  (let* ((rty (if ret-ty
+      ;; 		       (etype->type-t scope ret-ty)
+      ;; 		       (gen-tvar)))
+      ;; 	      (aty '())
+      ;; 	      (aty-eqs (loop
+      ;; 			  for (name type) in args
+      ;; 			  for tvar = (gen-tvar)
+      ;; 			  with aty-eqs = '()
+      ;; 			  do (push tvar aty)
+      ;; 			  when type do
+      ;; 			    (push (make-typ-eq :a tvar
+      ;; 					       :b (etype->type-t scope type)
+      ;; 					       :src-pos (etype-src-pos type))
+      ;; 				  aty-eqs)
+      ;; 			  finally
+      ;; 			    (setf aty (reverse aty))
+      ;; 			    (return (reverse aty-eqs))))
+
+      ;; 	      (arg-names (mapcar #'car args))
+
+      ;;         (eq0   (make-typ-eq :a (node-id->tvar id) :b ty1))
+
+      ;;         (funty (make-type-t :name :fun
+      ;;                             :args (append aty (list rty))))
+      ;;         (eq1   (make-typ-eq :a ty1
+      ;;                             :b funty))
+
+      ;; 	      (body-scope (types-scope-set-vars scope arg-names aty))
+      ;;         (body-eqs (gen-eqs-expr body-scope body rty)))
+      ;;    (values `(,eq1 ,eq0 ,@aty-eqs ,@body-eqs)
+      ;;            `())))
+      )))
+
+#+nil
+(defun gen-eqs-fundef (scope f)
+  (let-match* (((fundef name args ret-ty body id :src-pos *cur-src-pos*) f))
+    ;; Polymorhpic or not determined in discover-toplvls at the moment
+    (ematch (types-scope-get-var scope name)
+      ;; polymorphic function
+      ((and ty2 (svar))
+       (let* ((ty1 (gen-tvar))
+              (rty (if ret-ty
+		       (etype->type-t scope ret-ty)
+		       (gen-tvar)))
+	      (aty '())
+	      (aty-eqs (loop
+			  for (name type) in args
+			  for tvar = (gen-tvar)
+			  with aty-eqs = '()
+			  do (push tvar aty)
+			  when type do
+			    (push (make-typ-eq :a tvar
+					       :b (etype->type-t scope type)
+					       :src-pos (etype-src-pos type))
+				  aty-eqs)
+			  finally
+			    (setf aty (reverse aty))
+			    (return (reverse aty-eqs))))
+
+	      (arg-names (mapcar #'car args))
 
               (eq0   (make-typ-eq :a (node-id->tvar id) :b ty1))
 
               (funty (make-type-t :name :fun
                                   :args (append aty (list rty))))
+              (eq1   (make-typ-eq :a ty1
+                                  :b funty))
+              (eq2   (make-scm-eq :sv ty2
+                                  :ty ty1
+                                  :ty-scp scope))
 
+	      (body-scope (types-scope-set-vars scope arg-names aty))
+              (body-eqs (gen-eqs-expr body-scope body rty)))
+
+         (assert-all-fun-args-used f args aty body-eqs)
+
+         ;; toplvl scm-eqs should be first in the gen'd constraints
+         (values `(,eq1 ,eq0 ,@aty-eqs ,@body-eqs)
+                 `(,eq2))))
+
+      ;; monomorphic function
+      ((and ty1 (tvar))
+       (error "No function should be monomorphic!")
+       (let* ((rty (if ret-ty
+		       (etype->type-t scope ret-ty)
+		       (gen-tvar)))
+	      (aty '())
+	      (aty-eqs (loop
+			  for (name type) in args
+			  for tvar = (gen-tvar)
+			  with aty-eqs = '()
+			  do (push tvar aty)
+			  when type do
+			    (push (make-typ-eq :a tvar
+					       :b (etype->type-t scope type)
+					       :src-pos (etype-src-pos type))
+				  aty-eqs)
+			  finally
+			    (setf aty (reverse aty))
+			    (return (reverse aty-eqs))))
+
+	      (arg-names (mapcar #'car args))
+
+              (eq0   (make-typ-eq :a (node-id->tvar id) :b ty1))
+
+              (funty (make-type-t :name :fun
+                                  :args (append aty (list rty))))
               (eq1   (make-typ-eq :a ty1
                                   :b funty))
 
-              (body-ctx (append ctx (mapcar #'cons args aty)))
-              (eqs (gen-eqs-expr body-ctx body rty)))
-         (values `(,eq1 ,eq0 ,@eqs)
+	      (body-scope (types-scope-set-vars scope arg-names aty))
+              (body-eqs (gen-eqs-expr body-scope body rty)))
+         (values `(,eq1 ,eq0 ,@aty-eqs ,@body-eqs)
                  `()))))))
 
-(defun gen-eqs-expr (ctx expr ty)
+(defun gen-eqs-expr (scope expr ty)
   (let* ((*cur-src-pos* (ast-node-src-pos expr))
          (eq0  (make-typ-eq :a (node-id->tvar (ast-node-id expr))
-                           :b ty)))
-    `(,@(gen-eqs-expr/impl ctx expr ty) ,eq0)))
+			    :b ty)))
+    `(,@(gen-eqs-expr/impl scope expr ty) ,eq0)))
 
-(defun gen-eqs-expr/impl (ctx expr ty)
+(defun gen-eqs-expr/impl (scope expr ty)
   (ematch expr
     ((eblock stmts expr)
      (loop for stmt in stmts
-           with cctx = ctx
+           with cscope = scope
            with eqs  = '()
            do (let (eqs0)
-                (setf (values eqs0 cctx)
-                      (gen-eqs-stmt cctx stmt))
+                (setf (values eqs0 cscope)
+                      (gen-eqs-stmt cscope stmt))
                 (push eqs0 eqs))
            finally
-           (return (let* ((eeqs (gen-eqs-expr cctx expr ty)))
+           (return (let* ((eeqs (gen-eqs-expr cscope expr ty)))
                      `(,@(reduce #'append (reverse eqs)) ,@eeqs)))))
 
     ((varref name)
-     (let-match (((and vty (tvar)) (ctx-get ctx name)))
+     (let-match (((and vty (or (tvar)
+			       (type-t)))
+		  (types-scope-get-var scope name)))
        (list (make-typ-eq :a ty
                           :b vty))))
 
     ((funcal name args)
-     (let-match* ((aty (mapcar (lambda (_) (declare (ignore _)) (gen-tvar))
-                               args))
-                  (fty (ctx-get ctx name))
+     (if (> (length args) 0)
+	 (let-match* ((aty (mapcar (lambda (_) (declare (ignore _)) (gen-tvar))
+				   args))
+		      (fty (types-scope-get-var scope name))
 
-                  (funty (make-type-t :name :fun :args (append aty (list ty))))
-                  (eq1   (cond ((svar-p fty) (make-ins-eq :sv fty :tv funty))
-                               ((tvar-p fty) (make-typ-eq :a fty :b funty))))
+		      (funty (make-type-t :name :fun :args (append aty (list ty))))
+		      (eq1   (make-ins-eq :sv fty :tv funty))
 
-                  (a-eqs (mapcar (lambda (arg ty)
-                                   (gen-eqs-expr ctx arg ty))
-                                 args aty)))
-       `(,eq1 ,@(reduce #'append a-eqs))))
+		      (a-eqs (mapcar (lambda (arg ty)
+				       (gen-eqs-expr scope arg ty))
+				     args aty)))
+
+	   `(,eq1 ,@(reduce #'append a-eqs)))
+
+	 (let-match* ((aty (mapcar (lambda (_) (declare (ignore _)) (gen-tvar))
+				   args))
+		      (fty (types-scope-get-var scope name))
+
+		      (funty (make-type-t :name :fun :args (append aty (list ty))))
+		      (eq1   (make-ins-eq :sv fty :tv funty))
+
+		      (a-eqs (mapcar (lambda (arg ty)
+				       (gen-eqs-expr scope arg ty))
+				     args aty)))
+
+	   `(,eq1 ,@(reduce #'append a-eqs)))
+	 ))
+
+    ;; ((funcal name args)
+    ;;  (let-match* ((aty (mapcar (lambda (_) (declare (ignore _)) (gen-tvar))
+    ;;                            args))
+    ;;               (fty (types-scope-get-var scope name))
+
+    ;;               (funty (make-type-t :name :fun :args (append aty (list ty))))
+    ;;               (eq1   (cond ((svar-p fty) (make-ins-eq :sv fty :tv funty))
+    ;;                            ((tvar-p fty) (make-typ-eq :a fty :b funty))))
+
+    ;;               (a-eqs (mapcar (lambda (arg ty)
+    ;;                                (gen-eqs-expr scope arg ty))
+    ;;                              args aty)))
+    ;;    `(,eq1 ,@(reduce #'append a-eqs))))
 
     ((litera vty) (list (make-typ-eq
                           :a ty
                           :b (make-type-t :name vty))))))
 
-(defun gen-eqs-stmt (ctx stmt)
+(defun gen-eqs-stmt (scope stmt)
   (ematch stmt
     ((varlet name val)
      (let* ((ty0 (gen-tvar)))
-       (values (gen-eqs-expr ctx val ty0)
-               `((,name . ,ty0) ,@ctx))))
-    (_ (values (gen-eqs-expr ctx stmt (gen-tvar))
-               ctx))))
+       (values (gen-eqs-expr scope val ty0)
+	       (types-scope-set-var scope name ty0))))
+    (_ (values (gen-eqs-expr scope stmt (gen-tvar))
+               scope))))
 
-(defun discover-toplvls (m)
+(defun discover-toplvls (scope m)
   (loop for toplvl in (module-toplvls m)
-        with ctx = '()
         do (ematch toplvl
-             ;; All functions are svars since they call all be polymorhpic
+             ;; All functions are svars since they can all be polymorhpic
              ((fundef name args)
               ;; funcs of arity=0 are cannot be polymorphic
-              (push (cons name (if args
-                                   (gen-svar)
-                                   (gen-tvar)))
-                    ctx)))
+	      ;; TODO: make 0-arity funcs polymorphic as in normal polymorphic functions
+	      ;;(types-scope-push-var scope name (gen-svar)) BEFORE SPONGE
+	      (types-scope-push-var scope name (gen-svar))
 
-        finally (return ctx)))
+	      ;; (types-scope-push-var OLD
+	      ;;  scope name (if args
+	      ;; 		      (gen-svar)
+	      ;; 		      (gen-tvar)))
+	      ))
+
+        finally (return scope)))
 
 ;;=============================================================================
 ;; CONSTRAINT SOLVING
@@ -273,17 +485,18 @@ CONSTRAINT GENERATION:
                      (equal  a b)) nil)
 
              ;; tvar = x | x = tvar
+	     ;; (replace ast-tvars by tvars but not the other way around)
              ((or (typ-eq :a (and tv (tvar))
-                          :b x
+                          :b (and x (not (satisfies ast-tvar-p)))
                           :src-pos p)
-                  (typ-eq :a x
+                  (typ-eq :a (and x (not (satisfies ast-tvar-p)))
                           :b (and tv (tvar))
                           :src-pos p))
               (if (occurs? tv x)
                   (error (format nil "recursive type for ~S" tv))
                   (let ((sub (list (make-typ-eq :a tv :b x :src-pos p))))
                     (setf eqs (subst-eqs     eqs sub))
-                    (setf sol (compose-subst sol sub)))))
+                    (setf sol (compose-subst sol sub))))) ;; unswaped
 
              ;; <type> args... = <type> args...
              ((guard (typ-eq :a (type-t :name an :args a-args)
@@ -334,6 +547,7 @@ CONSTRAINT GENERATION:
                   (setf sol (compose-subst sol sub))
 
                   ;; ======
+		  #|
                   (when (match e ((scm-eq ; :sv (svar :name 'S1)
                                           ) t))
                     (break (format nil "break~%e: ~/fyrec:pprint-eq/~2%~
@@ -343,6 +557,7 @@ CONSTRAINT GENERATION:
                                         sub: ~/fyrec:pprint-eqs/~2%~
                                         sol: ~/fyrec:pprint-eqs/"
                                    e i-eqs eqs e-eqs sub sol)))
+		  |#
                   )))
 
              ((ins-eq)
@@ -379,10 +594,10 @@ CONSTRAINT GENERATION:
      (make-typ-eq :a (subst-ty a sub)
                   :b (subst-ty b sub)
                   :src-pos src-pos))
-    ((scm-eq sv ty ty-ctx src-pos)
+    ((scm-eq sv ty ty-scp src-pos)
      (make-scm-eq :sv sv
                   :ty (subst-ty ty sub)
-                  :ty-ctx (subst-ctx ty-ctx sub)
+                  :ty-scp (subst-types-scope-vars ty-scp sub)
                   :src-pos src-pos))
     ((ins-eq sv tv src-pos)
      (make-ins-eq :sv sv
@@ -399,11 +614,12 @@ CONSTRAINT GENERATION:
                   :args (mapcar (lambda (aty) (subst-ty aty sub))
                                 args)))))
 
-(defun subst-ctx (ctx sub)
-  "Substitute the tvars of the right sides of eqs of ctx according to sub"
-  (mapcar (lambda-ematch ((cons n ty)
-                          (cons n (subst-ty ty sub))))
-          ctx))
+(defun subst-types-scope-vars (scope sub)
+  "Substitute the tvars of the right sides of eqs of scope var entries according to sub"
+  (map-types-scope-vars scope (v)
+    (mapcar (lambda-ematch ((cons n ty)
+			    (cons n (subst-ty ty sub))))
+	    v)))
 
 (defun compose-subst (sub1 sub2)
   "Compose two substitutions such that (s2 ∘ s1)(x) = s2(s1(x))"
@@ -426,12 +642,14 @@ CONSTRAINT GENERATION:
                                           bound-vars)))
     (subst-ty ty instantiation-sub)))
 
-(defun scm-eq-bound-vars (e)
+(defun scm-eq-bound-vars (e &key debug)
   (ematch e
-    ((scm-eq ty ty-ctx)
+    ((scm-eq sv ty ty-scp)
      (let ((ty-ftvs  (ftv-ty ty))
-           (ctx-ftvs (ftv-ctx ty-ctx)))
-       (set-difference ty-ftvs ctx-ftvs :test #'equal)))))
+	   (ctx-ftvs (ftv-types-scope-vars ty-scp)))
+       (let ((bound-vars (set-difference ty-ftvs ctx-ftvs :test #'equal)))
+	 (format t "~&bound vars of ~S is ~S~%" sv bound-vars)
+	 bound-vars)))))
 
 (defun ftv-ty (ty)
   (ematch ty
@@ -442,17 +660,19 @@ CONSTRAINT GENERATION:
              (mapcar #'ftv-ty args)
              :initial-value '()))))
 
-(defun ftv-ctx (ctx)
+(defun ftv-types-scope-vars (scope)
+  "Find all the ftvs from the right hand sides of variable definitions in the scope"
   (reduce (lambda (a b) (union a b :test #'equal))
           (mapcar (lambda-ematch ((cons _ ty)
                                   (ftv-ty ty)))
-                  ctx)
+                  (types-scope-vars scope))
 
           :initial-value '()))
 
 (defun infer-module (m prg)
-  (let ((*infer-current-prg* prg))
-    (solve-eqs (gen-eqs-module m))))
+  (let* ((*infer-current-prg* prg)
+	 (unsolved-eqs (gen-eqs-module m)))
+    (values (solve-eqs unsolved-eqs) unsolved-eqs)))
 
 (defun ast-eqs->table (eqs)
   (let ((table (make-hash-table :test #'equal)))
@@ -470,10 +690,10 @@ CONSTRAINT GENERATION:
 ;;=============================================================================
 ;; VALIDATING
 
-;; If not all fun args are used in the body, the type of the function
-;;  will never be resolved as the eq for the unused arg will never have
-;;  a right handn side
 (defun assert-all-fun-args-used (fun args aty eqs)
+  "If not all fun args are used in the body, the type of the function
+will never be resolved as the eq for the unused arg will never have
+a right handn side"
   (loop for arg in args
         for ty in aty
         with bad = nil
@@ -521,7 +741,7 @@ CONSTRAINT GENERATION:
          (setf pn (num->letters *pretty-tvar-count*))
          (incf *pretty-tvar-count*)
          (setf (gethash tv *pretty-tvar-names*) pn))
-       (princ pn s)))))
+       (format s "~A" pn)))))
 
 (defparameter *pprint-tvar* nil)
 (defun pprint-ty (s ty &rest r)
@@ -531,7 +751,7 @@ CONSTRAINT GENERATION:
          (svar name))
      (if *pprint-tvar*
          (pprint-tvar s ty)
-         (princ name s)))
+	 (format s "~A" name)))
 
     ((type-t name args)
      (format s "~A(~{~/fyrec:pprint-ty/~^, ~})"
@@ -549,21 +769,26 @@ CONSTRAINT GENERATION:
     ((scm-eq sv ty)
      (format s "~/fyrec:pprint-ty/ s= forall ~{~/fyrec:pprint-ty/~^, ~}. ~
                                              ~/fyrec:pprint-ty/"
-             sv (scm-eq-bound-vars e) ty))))
+             ty (scm-eq-bound-vars e :debug t) sv))))
 
 (defun pprint-eqs (s eqs &rest r)
   (loop for e in eqs do
         (fresh-line s)
         (apply #'pprint-eq `(,s ,e ,@r))))
 
-(defun pprint-typed-ast (prg)
+(defun pprint-typed-ast (prg &key print-unsolved-eqs print-sol)
   (with-fresh-tvars
     (let* ((*pprint-tvar* nil)
            (*ast-node-count* 0)
            (ast (parse-module prg))
-           (sol (infer-module ast prg)))
-      ; (fresh-line)
-      ; (pprint-eqs t sol)
+	   (sol (multiple-value-bind (sol unsolved-eqs) (infer-module ast prg)
+		  (when print-unsolved-eqs
+		    (format t "~&~%unsolved eqs:~%")
+		    (pprint-eqs t unsolved-eqs))
+		  sol)))
+      (when print-sol
+	(format t "~&~%solution:~%")
+	(pprint-eqs t sol))
       (fresh-line)
       (sort sol (lambda-ematch* (((typ-eq :src-pos (list abs-a _ _))
                                   (typ-eq :src-pos (list abs-b _ _)))
@@ -583,14 +808,39 @@ CONSTRAINT GENERATION:
 
 #+nil
 (defparameter *test-prg*
-  "foo() = bar(1);
+  "
+   Foo = {
+       i   Int,
+       str String
+   };
+
+   Foo.T = {T, T};
+
+   
+   foo() = bar(1);
    bar(b) = {
        b
    };
    baz(a) = a;")
 
 #+nil
-(pprint-typed-ast *test-prg*)
+(defparameter *test-prg*
+  "
+  baz(a) = a;
+  bar() = baz(123);
+  foo() = bar();
+")
+
+#+nil
+(defparameter *test-prg*
+  "
+  bar(a) = a;
+  foo() = bar(123);
+  baz() = bar(\"string\");
+")
+
+#+nil
+(pprint-typed-ast *test-prg* :print-unsolved-eqs t :print-sol t)
 
 #+nil
 (with-fresh-tvars

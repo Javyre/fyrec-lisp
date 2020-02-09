@@ -9,6 +9,7 @@
                  (:file "fyrec")
                  (:file "infer")
                  (:file "ast-gen")
+		 (:file "std-lib")
                  (:file "compile"))))
   :description "A prototype fyre compiler"
   :long-description
